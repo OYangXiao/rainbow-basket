@@ -5,6 +5,7 @@ from scipy.linalg import cholesky
 import openpyxl
 import io
 import matplotlib.pyplot as plt
+from concurrent.futures import ThreadPoolExecutor
 
 # Step 1: Load and preprocess data
 with open("databank.xlsx", "rb") as file:
@@ -27,9 +28,34 @@ def garch_forecast(returns, horizon=57, window=252):
         forecasts.append(np.sqrt(forecast.variance.values[-1, :]))
     return np.mean(forecasts, axis=0)  # Average forecast over rolling windows
 
-vol_hs300 = garch_forecast(log_returns['HS300'])
-vol_sz50 = garch_forecast(log_returns['SZ50'])
-vol_zz500 = garch_forecast(log_returns['ZZ500'])
+# Optimize GARCH forecasting with multithreading
+def garch_forecast_multithreaded(returns, horizon=57, window=252):
+    model = arch_model(returns, vol='Garch', p=1, q=1, dist='Normal', rescale=False)
+
+    def forecast_chunk(start, end):
+        chunk_forecasts = []
+        for i in range(start, end):
+            train_data = returns.iloc[i-window:i]
+            model_fit = model.fit(disp='off')
+            forecast = model_fit.forecast(horizon=horizon)
+            chunk_forecasts.append(np.sqrt(forecast.variance.values[-1, :]))
+        return chunk_forecasts
+
+    forecasts = []
+    chunk_size = (len(returns) - window) // 8  # Divide into 8 threads
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [
+            executor.submit(forecast_chunk, i * chunk_size, (i + 1) * chunk_size)
+            for i in range(8)
+        ]
+        for future in futures:
+            forecasts.extend(future.result())
+
+    return np.mean(forecasts, axis=0)  # Average forecast over rolling windows
+
+vol_hs300 = garch_forecast_multithreaded(log_returns['HS300'])
+vol_sz50 = garch_forecast_multithreaded(log_returns['SZ50'])
+vol_zz500 = garch_forecast_multithreaded(log_returns['ZZ500'])
 
 # Save GARCH forecast results to Excel
 forecast_data = {
@@ -48,12 +74,14 @@ print(corr_matrix)
 # Step 3: Cholesky decomposition
 L = cholesky(corr_matrix, lower=True)
 
-# Define Monte Carlo simulation function for reusability
-def run_monte_carlo(n_simulations, n_days, initial_prices, vol_hs300, vol_sz50, vol_zz500, L, scale_factor=1.0):
+# Define Monte Carlo simulation function with multithreading
+
+# Ensure the function returns all expected values
+def run_monte_carlo_multithreaded(n_simulations, n_days, initial_prices, vol_hs300, vol_sz50, vol_zz500, L, scale_factor=1.0, plot_paths=False):
     vol_hs300_scaled = vol_hs300 * scale_factor
     vol_sz50_scaled = vol_sz50 * scale_factor
     vol_zz500_scaled = vol_zz500 * scale_factor
-    
+
     simulated_paths = {
         'HS300': np.zeros((n_simulations, n_days + 1)),
         'SZ50': np.zeros((n_simulations, n_days + 1)),
@@ -63,19 +91,72 @@ def run_monte_carlo(n_simulations, n_days, initial_prices, vol_hs300, vol_sz50, 
     simulated_paths['SZ50'][:, 0] = initial_prices[1]
     simulated_paths['ZZ500'][:, 0] = initial_prices[2]
 
-    for t in range(1, n_days + 1):
-        Z = np.random.normal(0, 1, (n_simulations, 3))
-        correlated_Z = Z @ L.T  # Note: Use L.T for upper if needed, but cholesky lower=True
-        log_ret = np.zeros((n_simulations, 3))
-        log_ret[:, 0] = correlated_Z[:, 0] * vol_hs300_scaled[t-1]
-        log_ret[:, 1] = correlated_Z[:, 1] * vol_sz50_scaled[t-1]
-        log_ret[:, 2] = correlated_Z[:, 2] * vol_zz500_scaled[t-1]
-        daily_ret = np.exp(log_ret)
-        log_ret = np.where(daily_ret > 1.1, np.log(1.1), log_ret)
-        log_ret = np.where(daily_ret < 0.9, np.log(0.9), log_ret)
-        simulated_paths['HS300'][:, t] = simulated_paths['HS300'][:, t-1] * np.exp(log_ret[:, 0])
-        simulated_paths['SZ50'][:, t] = simulated_paths['SZ50'][:, t-1] * np.exp(log_ret[:, 1])
-        simulated_paths['ZZ500'][:, t] = simulated_paths['ZZ500'][:, t-1] * np.exp(log_ret[:, 2])
+    def simulate_chunk(start, end):
+        for t in range(1, n_days + 1):
+            Z = np.random.normal(0, 1, (end - start, 3))
+            correlated_Z = Z @ L.T
+            log_ret = np.zeros((end - start, 3))
+            log_ret[:, 0] = correlated_Z[:, 0] * vol_hs300_scaled[t-1]
+            log_ret[:, 1] = correlated_Z[:, 1] * vol_sz50_scaled[t-1]
+            log_ret[:, 2] = correlated_Z[:, 2] * vol_zz500_scaled[t-1]
+            daily_ret = np.exp(log_ret)
+            log_ret = np.where(daily_ret > 1.1, np.log(1.1), log_ret)
+            log_ret = np.where(daily_ret < 0.9, np.log(0.9), log_ret)
+            simulated_paths['HS300'][start:end, t] = simulated_paths['HS300'][start:end, t-1] * np.exp(log_ret[:, 0])
+            simulated_paths['SZ50'][start:end, t] = simulated_paths['SZ50'][start:end, t-1] * np.exp(log_ret[:, 1])
+            simulated_paths['ZZ500'][start:end, t] = simulated_paths['ZZ500'][start:end, t-1] * np.exp(log_ret[:, 2])
+
+    chunk_size = n_simulations // 8  # Divide into 8 threads
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [
+            executor.submit(simulate_chunk, i * chunk_size, (i + 1) * chunk_size)
+            for i in range(8)
+        ]
+        for future in futures:
+            future.result()
+
+    # Plot paths if requested
+    if plot_paths:
+        fig, axes = plt.subplots(3, 1, figsize=(12,36))
+        num_paths_to_plot = min(100000, n_simulations)
+
+        # Plot HS300
+        for i in range(num_paths_to_plot):
+            axes[0].plot(simulated_paths['HS300'][i], color='blue', alpha=0.05)
+        axes[0].axhline(y=initial_prices[0], color='black', linestyle='--', label='Initial Price')
+        axes[0].axhline(y=initial_prices[0]*1.12, color='red', linestyle='--', label='Knock-out Threshold')
+        axes[0].grid(True, alpha=0.3)
+        axes[0].set_title('Simulated Paths - HS300 (Sample of 100000 paths)')
+        axes[0].set_xlabel('Days')
+        axes[0].set_ylabel('Index Level')
+        axes[0].legend()
+
+        # Plot SZ50
+        for i in range(num_paths_to_plot):
+            axes[1].plot(simulated_paths['SZ50'][i], color='green', alpha=0.05)
+        axes[1].axhline(y=initial_prices[1], color='black', linestyle='--', label='Initial Price')
+        axes[1].axhline(y=initial_prices[1]*1.12, color='red', linestyle='--', label='Knock-out Threshold')
+        axes[1].grid(True, alpha=0.3)
+        axes[1].set_title('Simulated Paths - SZ50 (Sample of 100000 paths)')
+        axes[1].set_xlabel('Days')
+        axes[1].set_ylabel('Index Level')
+        axes[1].legend()
+
+        # Plot ZZ500
+        for i in range(num_paths_to_plot):
+            axes[2].plot(simulated_paths['ZZ500'][i], color='orange', alpha=0.05)
+        axes[2].axhline(y=initial_prices[2], color='black', linestyle='--', label='Initial Price')
+        axes[2].axhline(y=initial_prices[2]*1.12, color='red', linestyle='--', label='Knock-out Threshold')
+        axes[2].grid(True, alpha=0.3)
+        axes[2].set_title('Simulated Paths - ZZ500 (Sample of 100000 paths)')
+        axes[2].set_xlabel('Days')
+        axes[2].set_ylabel('Index Level')
+        axes[2].legend()
+
+        plt.tight_layout()
+        plt.savefig('simulated_paths.png', dpi=300)
+        plt.close()
+        print("Simulated paths visualization saved as 'simulated_paths.png'.")
 
     # Knock-out events
     knock_out = np.zeros(n_simulations, dtype=bool)
@@ -108,30 +189,69 @@ def run_monte_carlo(n_simulations, n_days, initial_prices, vol_hs300, vol_sz50, 
 
     return knock_out_rate, mean_final_yield, avg_yield, final_yield
 
+# Replace original functions with optimized versions
+vol_hs300 = garch_forecast_multithreaded(log_returns['HS300'])
+vol_sz50 = garch_forecast_multithreaded(log_returns['SZ50'])
+vol_zz500 = garch_forecast_multithreaded(log_returns['ZZ500'])
+
+# Save GARCH forecast results to Excel
+forecast_data = {
+    'HS300': vol_hs300,
+    'SZ50': vol_sz50,
+    'ZZ500': vol_zz500
+}
+forecast_df = pd.DataFrame(forecast_data)
+forecast_df.to_excel('garch_forecast_results.xlsx', index=False)
+
+# Step 2: Compute correlation matrix
+corr_matrix = log_returns.corr()
+print("Correlation Matrix:")
+print(corr_matrix)
+
+# Step 3: Cholesky decomposition
+L = cholesky(corr_matrix, lower=True)
+
 # Parameters
 n_days = 57
 initial_prices = df.iloc[-1][['HS300', 'SZ50', 'ZZ500']].values
-base_n_sim = 1000000
+base_n_sim = 100000
 
-# Step 4: Base simulation (original)
-base_knock_out_rate, base_mean_final_yield, base_avg_yield, base_final_yield = run_monte_carlo(
-    base_n_sim, n_days, initial_prices, vol_hs300, vol_sz50, vol_zz500, L
-)
+# Store simulation results in a dictionary for reuse
+simulation_results = {}
+
+def get_or_run_simulation(n_sim, n_days, initial_prices, vol_hs300, vol_sz50, vol_zz500, L, scale_factor=1.0, plot_paths=False):
+    """Run simulation if not cached, otherwise return cached results"""
+    key = (n_sim, scale_factor)
+    if key not in simulation_results:
+        results = run_monte_carlo_multithreaded(n_sim, n_days, initial_prices, 
+                                              vol_hs300, vol_sz50, vol_zz500, L, 
+                                              scale_factor=scale_factor, 
+                                              plot_paths=plot_paths)
+        simulation_results[key] = results
+    return simulation_results[key]
+
+# Step 4: Base simulation
+print("Running base simulation...")
+base_results = get_or_run_simulation(base_n_sim, n_days, initial_prices, 
+                                   vol_hs300, vol_sz50, vol_zz500, L, 
+                                   plot_paths=True)
+base_knock_out_rate, base_mean_final_yield, base_avg_yield, base_final_yield = base_results
+
 print(f"Base Knock-out rate: {base_knock_out_rate*100:.2f}%")
 print(f"Base Average final yield (non-knock-out): {base_mean_final_yield*100:.2f}%")
 print(f"Base Overall average yield: {base_avg_yield*100:.2f}%")
 
-# Plot sample paths (original)
-# ... (keep original plotting code)
-
 # Step 8: Result Analysis - Vega Sensitivity
+print("Calculating Vega sensitivity...")
 scale_factors = [0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1.0, 1.05, 1.1, 1.15, 1.2, 1.25, 1.3]
 vega_results = []
 base_sigma = np.mean([np.mean(vol_hs300), np.mean(vol_sz50), np.mean(vol_zz500)])
 for k in scale_factors:
-    _, _, avg_yield, _ = run_monte_carlo(base_n_sim, n_days, initial_prices, vol_hs300, vol_sz50, vol_zz500, L, k)
+    _, _, avg_yield, _ = get_or_run_simulation(base_n_sim, n_days, initial_prices, 
+                                             vol_hs300, vol_sz50, vol_zz500, L, k)
     vega = (avg_yield - base_avg_yield) / ((k - 1) * base_sigma) if k != 1 else 0
     vega_results.append({'Scale': k, 'Avg Yield': avg_yield, 'Vega': vega})
+
 vega_df = pd.DataFrame(vega_results)
 vega_df.to_excel('vega_sensitivity.xlsx', index=False)
 print("Vega Sensitivity Results:")
@@ -147,15 +267,36 @@ plt.savefig('vega_plot.png')
 plt.close()
 
 # Step 9: Result Analysis - Convergence
-sim_counts = [10000, 20000, 50000, 100000, 1000000]
+print("Analyzing convergence...")
+sim_counts = [10000, 50000, 100000, 200000, 500000, 1000000]
 conv_results = []
+
 for n in sim_counts:
-    knock_out_rate, mean_final_yield, avg_yield, _ = run_monte_carlo(
+    # Run simulation if needed
+    knock_out_rate, mean_final_yield, avg_yield, final_yield = get_or_run_simulation(
         n, n_days, initial_prices, vol_hs300, vol_sz50, vol_zz500, L
     )
-    std_err_ko = np.sqrt(knock_out_rate * (1 - knock_out_rate) / n)  # Binomial std err for KO rate
-    std_err_yield = np.std([run_monte_carlo(1, n_days, initial_prices, vol_hs300, vol_sz50, vol_zz500, L)[2] for _ in range(100)]) / np.sqrt(100)  # Bootstrap std err for yield
-    conv_results.append({'N': n, 'KO Rate': knock_out_rate, 'Avg Yield': avg_yield, 'Std Err KO': std_err_ko, 'Std Err Yield': std_err_yield})
+    
+    # Calculate standard errors
+    std_err_ko = np.sqrt(knock_out_rate * (1 - knock_out_rate) / n)
+    
+    # For yield std error, use batching of existing results
+    batch_size = max(n // 100, 1)
+    batch_yields = []
+    for i in range(0, len(final_yield), batch_size):
+        batch_end = min(i + batch_size, len(final_yield))
+        batch_mean = np.mean(final_yield[i:batch_end]) if len(final_yield[i:batch_end]) > 0 else 0
+        batch_yields.append(batch_mean)
+    
+    std_err_yield = np.std(batch_yields) / np.sqrt(len(batch_yields)) if batch_yields else 0
+    conv_results.append({
+        'N': n, 
+        'KO Rate': knock_out_rate, 
+        'Avg Yield': avg_yield, 
+        'Std Err KO': std_err_ko, 
+        'Std Err Yield': std_err_yield
+    })
+
 conv_df = pd.DataFrame(conv_results)
 conv_df.to_excel('convergence_analysis.xlsx', index=False)
 print("Convergence Results:")
